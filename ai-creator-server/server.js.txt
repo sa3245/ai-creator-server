@@ -1,0 +1,304 @@
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const cors = require('cors');
+const axios = require('axios');
+const bodyParser = require('body-parser');
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || 'ai-creator-secret-2026-03';
+// 先用测试数据库，你后续可以替换成自己的MongoDB Atlas地址
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://test:test123456@cluster0.7kfqd.mongodb.net/aiCreator?retryWrites=true&w=majority';
+
+// 中间件
+app.use(cors());
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+
+// 连接MongoDB
+mongoose.connect(MONGODB_URI)
+  .then(() => console.log('MongoDB连接成功'))
+  .catch(err => console.error('MongoDB连接失败:', err));
+
+// -------------------------- 数据模型定义 --------------------------
+// 1. 用户模型
+const UserSchema = new mongoose.Schema({
+  username: { type: String, required: true, unique: true },
+  password: { type: String, required: true },
+  email: { type: String, required: true, unique: true },
+  balance: { type: Number, default: 0 }, // 账户余额
+  createTime: { type: Date, default: Date.now },
+  updateTime: { type: Date, default: Date.now }
+});
+
+// 2. 订单模型（充值/消费）
+const OrderSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  type: { type: String, enum: ['recharge', 'consume'], required: true }, // 充值/消费
+  amount: { type: Number, required: true }, // 金额
+  status: { type: String, enum: ['pending', 'success', 'failed'], default: 'pending' },
+  product: { type: String }, // 消费的产品（如：小说生成/图片生成）
+  orderNo: { type: String, unique: true }, // 订单号
+  createTime: { type: Date, default: Date.now }
+});
+
+// 3. 生成内容模型
+const ContentSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  type: { type: String, enum: ['novel', 'image', 'video'], required: true }, // 内容类型
+  prompt: { type: String, required: true }, // 用户输入的提示词
+  content: { type: String }, // 生成的内容（小说文本/图片URL/视频URL）
+  consumeAmount: { type: Number, required: true }, // 消耗的金额
+  createTime: { type: Date, default: Date.now }
+});
+
+const User = mongoose.model('User', UserSchema);
+const Order = mongoose.model('Order', OrderSchema);
+const Content = mongoose.model('Content', ContentSchema);
+
+// -------------------------- 工具函数 --------------------------
+// 生成唯一订单号
+const generateOrderNo = () => {
+  return Date.now() + Math.random().toString(36).substr(2, 9);
+};
+
+// 验证token中间件
+const auth = (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ code: 401, msg: '请先登录' });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.userId = decoded.id;
+    next();
+  } catch (err) {
+    return res.status(401).json({ code: 401, msg: 'token无效或过期' });
+  }
+};
+
+// -------------------------- 接口实现 --------------------------
+// 1. 健康检查（部署后测试用）
+app.get('/', (req, res) => {
+  res.json({ code: 200, msg: '后端服务运行正常' });
+});
+
+// 2. 用户注册
+app.post('/api/register', async (req, res) => {
+  try {
+    const { username, password, email } = req.body;
+    // 检查用户是否已存在
+    const existingUser = await User.findOne({ $or: [{ username }, { email }] });
+    if (existingUser) return res.status(400).json({ code: 400, msg: '用户名或邮箱已存在' });
+    // 密码加密
+    const hashedPassword = await bcrypt.hash(password, 10);
+    // 创建用户
+    const user = new User({ username, password: hashedPassword, email });
+    await user.save();
+    res.status(201).json({ code: 200, msg: '注册成功', data: { username, email } });
+  } catch (err) {
+    res.status(500).json({ code: 500, msg: '服务器错误', error: err.message });
+  }
+});
+
+// 3. 用户登录
+app.post('/api/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    // 查找用户
+    const user = await User.findOne({ username });
+    if (!user) return res.status(400).json({ code: 400, msg: '用户名或密码错误' });
+    // 验证密码
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) return res.status(400).json({ code: 400, msg: '用户名或密码错误' });
+    // 生成token
+    const token = jwt.sign({ id: user._id, username: user.username }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ 
+      code: 200, 
+      msg: '登录成功', 
+      data: { 
+        token, 
+        user: { id: user._id, username: user.username, balance: user.balance } 
+      } 
+    });
+  } catch (err) {
+    res.status(500).json({ code: 500, msg: '服务器错误', error: err.message });
+  }
+});
+
+// 4. 充值接口
+app.post('/api/recharge', auth, async (req, res) => {
+  try {
+    const { amount } = req.body;
+    if (amount <= 0) return res.status(400).json({ code: 400, msg: '充值金额必须大于0' });
+    // 创建充值订单
+    const order = new Order({
+      userId: req.userId,
+      type: 'recharge',
+      amount,
+      status: 'success', // 测试阶段直接设为成功，上线需对接支付回调
+      orderNo: generateOrderNo()
+    });
+    await order.save();
+    // 更新用户余额
+    await User.findByIdAndUpdate(req.userId, { $inc: { balance: amount } });
+    const updatedUser = await User.findById(req.userId);
+    res.json({ code: 200, msg: '充值成功', data: { orderNo: order.orderNo, balance: updatedUser.balance } });
+  } catch (err) {
+    res.status(500).json({ code: 500, msg: '服务器错误', error: err.message });
+  }
+});
+
+// 5. AI小说生成接口
+app.post('/api/create/novel', auth, async (req, res) => {
+  try {
+    const { prompt, wordCount = 1000 } = req.body;
+    const consumeAmount = wordCount * 0.001; // 按字数计费，1000字1元
+    // 检查余额
+    const user = await User.findById(req.userId);
+    if (user.balance < consumeAmount) return res.status(400).json({ code: 400, msg: '余额不足' });
+    // 模拟AI小说生成（上线替换为真实API）
+    const novelContent = `【AI创作平台-小说生成】\n\n创作要求：${prompt}\n\n${Array(wordCount).fill('测试文本').join('').substring(0, wordCount)}`;
+    // 创建消费订单
+    const order = new Order({
+      userId: req.userId,
+      type: 'consume',
+      amount: consumeAmount,
+      status: 'success',
+      product: '小说生成',
+      orderNo: generateOrderNo()
+    });
+    await order.save();
+    // 保存生成的内容
+    const content = new Content({
+      userId: req.userId,
+      type: 'novel',
+      prompt,
+      content: novelContent,
+      consumeAmount
+    });
+    await content.save();
+    // 扣减余额
+    await User.findByIdAndUpdate(req.userId, { $inc: { balance: -consumeAmount } });
+    const updatedUser = await User.findById(req.userId);
+    res.json({ 
+      code: 200, 
+      msg: '小说生成成功', 
+      data: { 
+        content: novelContent, 
+        consumeAmount, 
+        remainingBalance: updatedUser.balance 
+      } 
+    });
+  } catch (err) {
+    res.status(500).json({ code: 500, msg: '服务器错误', error: err.message });
+  }
+});
+
+// 6. AI图片生成接口
+app.post('/api/create/image', auth, async (req, res) => {
+  try {
+    const { prompt, size = '512x512' } = req.body;
+    const consumeAmount = 1; // 每张图片1元
+    // 检查余额
+    const user = await User.findById(req.userId);
+    if (user.balance < consumeAmount) return res.status(400).json({ code: 400, msg: '余额不足' });
+    // 模拟图片生成（上线替换为Stable Diffusion/OpenAI DALL-E）
+    const imageUrl = `https://picsum.photos/${size.split('x')[0]}/${size.split('x')[1]}`;
+    // 创建消费订单
+    const order = new Order({
+      userId: req.userId,
+      type: 'consume',
+      amount: consumeAmount,
+      status: 'success',
+      product: '图片生成',
+      orderNo: generateOrderNo()
+    });
+    await order.save();
+    // 保存生成的内容
+    const content = new Content({
+      userId: req.userId,
+      type: 'image',
+      prompt,
+      content: imageUrl,
+      consumeAmount
+    });
+    await content.save();
+    // 扣减余额
+    await User.findByIdAndUpdate(req.userId, { $inc: { balance: -consumeAmount } });
+    const updatedUser = await User.findById(req.userId);
+    res.json({ 
+      code: 200, 
+      msg: '图片生成成功', 
+      data: { 
+        imageUrl, 
+        consumeAmount, 
+        remainingBalance: updatedUser.balance 
+      } 
+    });
+  } catch (err) {
+    res.status(500).json({ code: 500, msg: '服务器错误', error: err.message });
+  }
+});
+
+// 7. AI视频生成接口（简化版）
+app.post('/api/create/video', auth, async (req, res) => {
+  try {
+    const { prompt, duration = 10 } = req.body;
+    const consumeAmount = duration * 0.5; // 每10秒5元
+    // 检查余额
+    const user = await User.findById(req.userId);
+    if (user.balance < consumeAmount) return res.status(400).json({ code: 400, msg: '余额不足' });
+    // 模拟视频生成（上线对接剪映API/阿里云视频生成）
+    const videoUrl = `https://example.com/video/${generateOrderNo()}.mp4`;
+    // 创建消费订单
+    const order = new Order({
+      userId: req.userId,
+      type: 'consume',
+      amount: consumeAmount,
+      status: 'success',
+      product: '视频生成',
+      orderNo: generateOrderNo()
+    });
+    await order.save();
+    // 保存生成的内容
+    const content = new Content({
+      userId: req.userId,
+      type: 'video',
+      prompt,
+      content: videoUrl,
+      consumeAmount
+    });
+    await content.save();
+    // 扣减余额
+    await User.findByIdAndUpdate(req.userId, { $inc: { balance: -consumeAmount } });
+    const updatedUser = await User.findById(req.userId);
+    res.json({ 
+      code: 200, 
+      msg: '视频生成成功', 
+      data: { 
+        videoUrl, 
+        consumeAmount, 
+        remainingBalance: updatedUser.balance 
+      } 
+    });
+  } catch (err) {
+    res.status(500).json({ code: 500, msg: '服务器错误', error: err.message });
+  }
+});
+
+// 8. 获取用户余额
+app.get('/api/user/balance', auth, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId);
+    res.json({ code: 200, data: { balance: user.balance } });
+  } catch (err) {
+    res.status(500).json({ code: 500, msg: '服务器错误', error: err.message });
+  }
+});
+
+// 启动服务器
+app.listen(PORT, () => {
+  console.log(`服务器运行在 http://localhost:${PORT}`);
+});
